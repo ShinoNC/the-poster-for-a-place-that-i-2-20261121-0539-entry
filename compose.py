@@ -1,528 +1,678 @@
 #!/usr/bin/env python3
-"""SALMIRA v2 — a rich, painterly travel poster of a salt-flat mirror town.
+"""SALMIRA v3 — painterly salt-flat mirror town poster.
 
-Fresh build for the-poster-for-a-place-that-i-2-20261121-0539 (v2).
-Renders at 2x (2048) and downscales to the 1024x1024 gate size.
-Deterministic: fixed seed, no network, no time input.
+Fresh code, written in this session. Renders 1024x1024 at 2x supersample:
+numpy gradients, blurred glow layers, layered grain, brush dabs,
+wave-distorted mirror reflection, detailed town and robed travellers.
+Deterministic (fixed seeds). Run: python3 compose.py -> entry.png
 """
 import math
 import random
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
-SEED = 20261121
-rng = random.Random(SEED)
-np_rng = np.random.default_rng(SEED)
+random.seed(20261121)
+rng = np.random.default_rng(20261121)
 
-S = 2                      # supersample factor
-W = H = 1024 * S
-FRAME = 26 * S             # cream frame width
-INNER = 30 * S             # inner rule offset
-HORIZON = 548 * S          # horizon line (mirror below)
+SS = 2  # supersample factor
+W = H = 1024
+SW, SH = W * SS, H * SS
+M = 16  # cream margin, unit px
+HY = 545  # horizon y, unit px
+SUN = (560, 458)  # sun centre, unit px (open sky, clear of rooftops)
 
-CREAM = (244, 236, 214)
-NAME_COLOR = (250, 242, 222)
-SUB_COLOR = (255, 216, 150)
-INK = (58, 38, 66)
-
-FONT_NAME = "/usr/share/fonts/truetype/noto/NotoSerifDisplay-Black.ttf"
-FONT_SUB = "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf"
+NAME_FONT = "/usr/share/fonts/truetype/noto/NotoSerifDisplay-Black.ttf"
+SUB_FONT = "/usr/share/fonts/truetype/noto/NotoSerifDisplay-Bold.ttf"
 
 
-def x(v):
-    """1024-space coordinate -> work coordinate."""
-    return int(round(v * S))
-
-
-def pts(points):
-    return [(x(px), x(py)) for px, py in points]
+def S(v):
+    """Unit px (1024 space) -> supersampled px."""
+    return int(round(v * SS))
 
 
 def lerp(a, b, t):
-    return tuple(int(round(a[i] + (b[i] - a[i]) * t)) for i in range(3))
+    return a + (b - a) * t
 
 
-def vgrad(width, height, stops):
-    """Vertical gradient image from a list of (pos0to1, rgb) stops."""
-    ys = np.linspace(0.0, 1.0, height)
-    arr = np.zeros((height, width, 3), dtype=np.uint8)
-    pos = np.array([s[0] for s in stops])
-    cols = np.array([s[1] for s in stops], dtype=np.float64)
-    for ch in range(3):
-        arr[:, :, ch] = np.interp(ys, pos, cols[:, ch])[:, None]
-    return Image.fromarray(arr, "RGB")
+def mix(c1, c2, t):
+    return tuple(int(round(lerp(a, b, t))) for a, b in zip(c1, c2))
 
 
-def soft_ellipse(layer, cx, cy, rx, ry, color, blur):
-    """Draw a blurred filled ellipse onto an RGBA layer (1024-space coords)."""
-    tmp = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    d = ImageDraw.Draw(tmp)
-    d.ellipse([x(cx - rx), x(cy - ry), x(cx + rx), x(cy + ry)], fill=color)
-    tmp = tmp.filter(ImageFilter.GaussianBlur(x(blur)))
-    layer.alpha_composite(tmp)
+def vgrad(w, h, stops):
+    """Vertical gradient. stops: list of (pos 0..1, (r,g,b))."""
+    ys = np.linspace(0, 1, h)
+    cols = np.zeros((h, 3))
+    xs = [s[0] for s in stops]
+    for c in range(3):
+        cols[:, c] = np.interp(ys, xs, [s[1][c] for s in stops])
+    arr = np.repeat(cols[:, None, :], w, axis=1)
+    return Image.fromarray(arr.astype(np.uint8), "RGB")
 
 
-def glow_dot(layer, cx, cy, r, color, blur):
-    soft_ellipse(layer, cx, cy, r, r, color, blur)
+def hgrad(w, h, stops):
+    ys = np.linspace(0, 1, w)
+    cols = np.zeros((w, 3))
+    xs = [s[0] for s in stops]
+    for c in range(3):
+        cols[:, c] = np.interp(ys, xs, [s[1][c] for s in stops])
+    arr = np.repeat(cols[None, :, :], h, axis=0)
+    return Image.fromarray(arr.astype(np.uint8), "RGB")
 
 
-def person(draw, bx, by, h, color, rim, staff=False, lantern=False):
-    """A small walking silhouette. (bx, by) = feet, h = height (1024-space)."""
-    head_r = h * 0.11
-    hip = by - h * 0.48
-    shoulder = by - h * 0.78
-    head_cy = by - h * 0.90
-    # long shadow toward the viewer-left (sun sits right)
-    sh = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    ds = ImageDraw.Draw(sh)
-    ds.ellipse([x(bx - h * 0.85), x(by - h * 0.06), x(bx + h * 0.25),
-                x(by + h * 0.10)], fill=(30, 20, 55, 70))
-    sh = sh.filter(ImageFilter.GaussianBlur(x(3)))
-    draw._image.alpha_composite(sh)
-    # legs
-    draw.line([x(bx), x(hip), x(bx - h * 0.10), x(by)], fill=color, width=x(4))
-    draw.line([x(bx), x(hip), x(bx + h * 0.13), x(by)], fill=color, width=x(4))
-    # robe / torso (slightly tapered)
-    draw.polygon(pts([(bx - h * 0.10, shoulder), (bx + h * 0.10, shoulder),
-                      (bx + h * 0.13, hip), (bx - h * 0.11, hip)]), fill=color)
-    # head
-    draw.ellipse([x(bx - head_r), x(head_cy - head_r),
-                  x(bx + head_r), x(head_cy + head_r)], fill=color)
-    # warm rim light on the sun side (right edge)
-    draw.arc([x(bx - head_r), x(head_cy - head_r),
-              x(bx + head_r), x(head_cy + head_r)],
-             start=-70, end=70, fill=rim, width=x(2))
-    draw.line([x(bx + h * 0.10), x(shoulder), x(bx + h * 0.12), x(hip)],
-              fill=rim, width=x(2))
+def soft_blob_layer(size, blobs):
+    """RGBA layer with soft radial blobs. blobs: (cx, cy, r, (r,g,b,a))."""
+    layer = Image.new("RGBA", size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    for cx, cy, r, col in blobs:
+        d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=col)
+    return layer.filter(ImageFilter.GaussianBlur(S(18)))
+
+
+def screen_glow(base, blobs, blur=S(26)):
+    """Add warm light: blurred coloured blobs composited with screen."""
+    glow = Image.new("RGB", base.size, (0, 0, 0))
+    d = ImageDraw.Draw(glow)
+    for cx, cy, r, col in blobs:
+        d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=col)
+    glow = glow.filter(ImageFilter.GaussianBlur(blur))
+    return ImageChops.screen(base, glow)
+
+
+def add_grain(img, sigma_fine=3.0, sigma_coarse=5.0):
+    """Two-scale luminance grain (subtle; smoothed again by downscale)."""
+    arr = np.asarray(img).astype(np.float32)
+    h, w = arr.shape[:2]
+    fine = rng.normal(0, sigma_fine, (h, w))[..., None]
+    coarse_small = rng.normal(0, sigma_coarse, (h // 16, w // 16))
+    coarse = np.asarray(
+        Image.fromarray(((coarse_small + 128).clip(0, 255)).astype(np.uint8)).resize(
+            (w, h), Image.BICUBIC
+        )
+    ).astype(np.float32)[..., None] - 128
+    out = np.clip(arr + fine + coarse, 0, 255)
+    return Image.fromarray(out.astype(np.uint8), "RGB")
+
+
+def brush_dabs(size, regions, n=900):
+    """Short directional strokes, painterly texture. regions: (box, colors, horiz)."""
+    layer = Image.new("RGBA", size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    for box, colors, horiz, alpha in regions:
+        x0, y0, x1, y1 = box
+        for _ in range(n // len(regions)):
+            x = random.uniform(x0, x1)
+            y = random.uniform(y0, y1)
+            ln = random.uniform(S(6), S(26))
+            ang = random.uniform(-0.14, 0.14) if horiz else random.uniform(1.2, 1.9)
+            dx, dy = math.cos(ang) * ln / 2, math.sin(ang) * ln / 2
+            col = random.choice(colors)
+            a = random.randint(max(6, alpha - 18), alpha + 14)
+            d.line([(x - dx, y - dy), (x + dx, y + dy)],
+                   fill=col + (a,), width=random.randint(S(1), S(3)))
+    return layer.filter(ImageFilter.GaussianBlur(S(1)))
+
+
+def wave_reflect(img, squish=0.52, amp=7, wavelength=110):
+    """Flip vertically, squash, sine-shift each row: rippled mirror."""
+    w, h = img.size
+    flipped = img.transpose(Image.FLIP_TOP_BOTTOM).resize((w, int(h * squish)))
+    arr = np.asarray(flipped).astype(np.float32)
+    hh = arr.shape[0]
+    out = np.zeros_like(arr)
+    for y in range(hh):
+        shift = int(amp * math.sin(2 * math.pi * y / wavelength + y * 0.015)
+                    * (0.4 + 1.6 * y / hh))
+        out[y] = np.roll(arr[y], shift, axis=0)
+    return Image.fromarray(out.astype(np.uint8), "RGB")
+
+
+def arch(d, x, y, w, h, fill):
+    """Arched-top window/door: rect + semicircle top."""
+    r = w / 2
+    d.rectangle([x, y + r, x + w, y + h], fill=fill)
+    d.pieslice([x, y, x + w, y + w], 180, 360, fill=fill)
+
+
+# ---------------------------------------------------------------- canvas
+canvas = Image.new("RGB", (SW, SH), (247, 242, 230))
+art = Image.new("RGB", (SW, SH), (30, 20, 70))
+ad = ImageDraw.Draw(art)
+
+AX0, AY0, AX1, AY1 = S(M), S(M), S(W - M), S(H - M)
+AW, AH = AX1 - AX0, AY1 - AY0
+
+# ---------------------------------------------------------------- sky
+sky = vgrad(AW, S(HY - M), [
+    (0.00, (24, 14, 60)),
+    (0.22, (52, 28, 98)),
+    (0.45, (104, 48, 126)),
+    (0.68, (166, 70, 112)),
+    (0.86, (212, 116, 82)),
+    (1.00, (236, 152, 92)),
+])
+art.paste(sky, (AX0, AY0))
+
+# warm halo around the sun's side of the sky
+art = screen_glow(art, [
+    (S(SUN[0]), S(SUN[1]), S(220), (90, 50, 25)),
+    (S(SUN[0]), S(SUN[1]), S(100), (115, 75, 32)),
+], blur=S(40))
+ad = ImageDraw.Draw(art)
+
+# soft clouds: blurred ellipses, rose / violet / amber
+cloud_layer = Image.new("RGBA", (SW, SH), (0, 0, 0, 0))
+cd = ImageDraw.Draw(cloud_layer)
+for _ in range(26):
+    cx = random.uniform(AX0, AX1)
+    cy = random.uniform(S(300), S(520))
+    rw = random.uniform(S(60), S(190))
+    rh = random.uniform(S(6), S(16))
+    tone = random.choice([(226, 150, 140, 46), (170, 110, 160, 40),
+                          (240, 180, 120, 42), (140, 90, 150, 36)])
+    cd.ellipse([cx - rw, cy - rh, cx + rw, cy + rh], fill=tone)
+cloud_layer = cloud_layer.filter(ImageFilter.GaussianBlur(S(7)))
+art = Image.alpha_composite(art.convert("RGBA"), cloud_layer).convert("RGB")
+ad = ImageDraw.Draw(art)
+
+# stars (upper sky) + sparkles
+for _ in range(150):
+    x = random.uniform(AX0, AX1)
+    y = random.uniform(AY0, S(330))
+    r = random.uniform(S(0.6), S(1.8))
+    a = random.randint(120, 255)
+    ad.ellipse([x - r, y - r, x + r, y + r],
+               fill=(255, 244, 214) if random.random() < 0.7 else (255, 255, 255))
+for _ in range(12):
+    x = random.uniform(AX0 + S(40), AX1 - S(40))
+    y = random.uniform(AY0 + S(20), S(280))
+    ln = random.uniform(S(4), S(9))
+    wdt = max(1, S(1))
+    ad.line([(x - ln, y), (x + ln, y)], fill=(255, 250, 230), width=wdt)
+    ad.line([(x, y - ln), (x, y + ln)], fill=(255, 250, 230), width=wdt)
+
+# birds
+for _ in range(8):
+    x = random.uniform(AX0 + S(60), AX1 - S(120))
+    y = random.uniform(S(240), S(420))
+    s = random.uniform(S(5), S(10))
+    ad.arc([x - s, y - s * 0.6, x, y + s * 0.6], 200, 340,
+           fill=(40, 26, 60), width=max(1, S(1)))
+    ad.arc([x, y - s * 0.6, x + s, y + s * 0.6], 200, 340,
+           fill=(40, 26, 60), width=max(1, S(1)))
+
+# ---------------------------------------------------------------- sun
+sun_r = S(54)
+art = screen_glow(art, [
+    (S(SUN[0]), S(SUN[1]), S(110), (255, 190, 90)),
+    (S(SUN[0]), S(SUN[1]), S(55), (255, 220, 140)),
+], blur=S(30))
+ad = ImageDraw.Draw(art)
+# sun disc with a gradient (pale top -> amber bottom) so it reads as a disc
+disc = vgrad(S(108), S(108),
+             [(0.0, (255, 246, 208)), (0.55, (255, 228, 150)),
+              (1.0, (244, 192, 100))])
+dmask = Image.new("L", (S(108), S(108)), 0)
+ddm = ImageDraw.Draw(dmask)
+ddm.ellipse([0, 0, S(108), S(108)], fill=255)
+art.paste(disc, (S(SUN[0]) - S(54), S(SUN[1]) - S(54)), dmask)
+ad = ImageDraw.Draw(art)
+ad.ellipse([S(SUN[0]) - sun_r, S(SUN[1]) - sun_r,
+            S(SUN[0]) + sun_r, S(SUN[1]) + sun_r],
+           outline=(232, 176, 96), width=S(2))
+# one thin cloud band crossing the low sun
+ad.ellipse([S(SUN[0] - 130), S(SUN[1] + 8),
+            S(SUN[0] + 130), S(SUN[1] + 16)], fill=(232, 150, 110))
+
+# ---------------------------------------------------------------- mountains
+def ridge(base_y, peaks, color):
+    pts = [(AX0, S(base_y))]
+    xs = np.linspace(AX0, AX1, len(peaks))
+    for x, p in zip(xs, peaks):
+        pts.append((x, S(base_y) - S(p)))
+    pts += [(AX1, S(base_y))]
+    ad.polygon(pts, fill=color)
+
+ridge(HY, [26, 44, 30, 58, 40, 66, 34, 48, 28, 52, 30],
+      (128, 92, 142))  # far, hazy
+ridge(HY, [14, 22, 10, 30, 18, 26, 12, 20, 16, 24, 12],
+      (76, 52, 98))  # near, darker
+# haze band over the far ridge
+haze = Image.new("RGBA", (SW, SH), (0, 0, 0, 0))
+hd = ImageDraw.Draw(haze)
+for i in range(30):
+    y = S(HY - 70) + i * S(70) // 30
+    hd.line([(AX0, y), (AX1, y)], fill=(196, 150, 178, 26 - i // 2))
+art = Image.alpha_composite(art.convert("RGBA"), haze).convert("RGB")
+ad = ImageDraw.Draw(art)
+
+# ---------------------------------------------------------------- town
+TOWN_Y = HY
+lit_windows = []  # (x, y) for glow dots
+
+
+def building(x, w, h, dome=True, tone=None):
+    base = tone or (random.randint(208, 232), random.randint(186, 210),
+                    random.randint(168, 190))
+    dark = mix(base, (90, 60, 100), 0.35)
+    d = ad
+    d.rectangle([S(x), S(TOWN_Y - h), S(x + w), S(TOWN_Y)], fill=base)
+    # shaded right side (sun is to the right of most of the town)
+    d.rectangle([S(x + w * 0.72), S(TOWN_Y - h), S(x + w), S(TOWN_Y)],
+                fill=mix(base, dark, 0.5))
+    if dome:
+        dw = w * random.uniform(0.55, 0.8)
+        dx = x + (w - dw) / 2
+        d.pieslice([S(dx), S(TOWN_Y - h - dw * 0.55), S(dx + dw),
+                    S(TOWN_Y - h + dw * 0.45)], 180, 360, fill=mix(base, (255, 240, 210), 0.25))
+        d.ellipse([S(dx + dw / 2) - S(1.5), S(TOWN_Y - h - dw * 0.55) - S(4),
+                   S(dx + dw / 2) + S(1.5), S(TOWN_Y - h - dw * 0.55)], fill=(200, 140, 70))
+    else:
+        d.rectangle([S(x - 2), S(TOWN_Y - h - 4), S(x + w + 2), S(TOWN_Y - h)],
+                    fill=mix(base, (120, 90, 110), 0.3))
+    # arched windows
+    n = max(1, int(w // 16))
+    for i in range(n):
+        wx = x + 5 + i * (w - 10) / max(1, n) + random.uniform(-1, 1)
+        wy = TOWN_Y - h + 8 + random.uniform(0, max(0, h - 26))
+        lit = random.random() < 0.55
+        col = (255, 186, 92) if lit else (64, 44, 88)
+        arch(d, S(wx), S(wy), S(6), S(10), col)
+        if lit:
+            lit_windows.append((S(wx + 3), S(wy + 5)))
+
+
+def minaret(x, h):
+    w = 11
+    base = (222, 200, 178)
+    ad.rectangle([S(x), S(TOWN_Y - h), S(x + w), S(TOWN_Y)], fill=base)
+    ad.rectangle([S(x + w * 0.6), S(TOWN_Y - h), S(x + w), S(TOWN_Y)],
+                 fill=mix(base, (90, 60, 100), 0.4))
+    ad.polygon([(S(x - 2), S(TOWN_Y - h)), (S(x + w + 2), S(TOWN_Y - h)),
+                (S(x + w / 2), S(TOWN_Y - h - 16))], fill=(190, 110, 70))
+    ad.ellipse([S(x + w / 2) - S(1.5), S(TOWN_Y - h - 22),
+                S(x + w / 2) + S(1.5), S(TOWN_Y - h - 16)], fill=(230, 180, 90))
+    arch(ad, S(x + 2), S(TOWN_Y - h + 12), S(5), S(9), (255, 186, 92))
+    lit_windows.append((S(x + 4.5), S(TOWN_Y - h + 16)))
+
+
+x = 34
+while x < 700:
+    w = random.uniform(30, 66)
+    h = random.uniform(20, 52)
+    building(x, w, h, dome=random.random() < 0.7)
+    x += w + random.uniform(2, 10)
+minaret(150, 78)
+minaret(486, 88)
+minaret(640, 66)
+# a couple of striped awnings
+for ax, ay, awd in [(210, TOWN_Y - 34, 26), (420, TOWN_Y - 28, 22)]:
+    for i in range(5):
+        col = (196, 90, 70) if i % 2 == 0 else (244, 230, 210)
+        ad.polygon([(S(ax + i * awd / 5), S(ay)),
+                    (S(ax + (i + 1) * awd / 5), S(ay)),
+                    (S(ax + (i + 1) * awd / 5 - 2), S(ay + 9)),
+                    (S(ax + i * awd / 5 + 2), S(ay + 9))], fill=col)
+# lantern dots along the waterfront
+for lx in range(60, 700, 34):
+    if random.random() < 0.8:
+        ly = TOWN_Y - random.uniform(2, 8)
+        ad.ellipse([S(lx) - S(2), S(ly) - S(2), S(lx) + S(2), S(ly) + S(2)],
+                   fill=(255, 200, 110))
+        lit_windows.append((S(lx), S(ly)))
+
+# ---------------------------------------------------------------- tower
+TX = 800  # tower centre x, unit px
+TBASE = HY
+SHAFT_TOP = 338
+SHAFT_W_TOP, SHAFT_W_BOT = 44, 58
+
+# steps
+for i, (sw, sh) in enumerate([(96, 10), (82, 10), (68, 8)]):
+    y0 = TBASE - (28 - i * 10)
+    ad.rectangle([S(TX - sw / 2), S(y0), S(TX + sw / 2), S(y0 + 10)],
+                 fill=mix((216, 202, 180), (120, 95, 110), i * 0.18))
+# shaft with vertical shading (sun left -> left face lit)
+shaft = Image.new("RGB", (S(SHAFT_W_BOT + 8), S(TBASE - SHAFT_TOP)), (0, 0, 0))
+sg = hgrad(S(SHAFT_W_BOT + 8), S(TBASE - SHAFT_TOP),
+           [(0.0, (238, 226, 200)), (0.45, (226, 212, 186)),
+            (0.8, (196, 178, 158)), (1.0, (168, 148, 132))])
+shaft.paste(sg, (0, 0))
+sd = ImageDraw.Draw(shaft)
+# taper: keep as rect, the eye reads the dome + base as taper; add banding
+for yy in range(0, S(TBASE - SHAFT_TOP), S(13)):
+    sd.line([(0, yy), (S(SHAFT_W_BOT + 8), yy)], fill=(170, 150, 128), width=S(1))
+art.paste(shaft, (S(TX - SHAFT_W_BOT / 2 - 4), S(SHAFT_TOP)))
+ad = ImageDraw.Draw(art)
+# arched lit windows on the shaft
+for wy in [372, 410, 448, 486]:
+    arch(ad, S(TX - 7), S(wy), S(14), S(22), (255, 190, 96))
+    lit_windows.append((S(TX), S(wy + 11)))
+# balcony ring with balusters
+ad.rectangle([S(TX - 34), S(SHAFT_TOP - 12), S(TX + 34), S(SHAFT_TOP - 2)],
+             fill=(206, 188, 164))
+for bx in range(-30, 31, 6):
+    ad.rectangle([S(TX + bx), S(SHAFT_TOP - 22), S(TX + bx + 3), S(SHAFT_TOP - 12)],
+                 fill=(188, 168, 142))
+ad.rectangle([S(TX - 36), S(SHAFT_TOP - 24), S(TX + 36), S(SHAFT_TOP - 20)],
+             fill=(226, 208, 184))
+# copper dome: vertical gradient masked to dome shape
+dome_w, dome_h = 100, 56
+dome_grad = vgrad(S(dome_w), S(dome_h),
+                  [(0.0, (224, 138, 80)), (0.45, (196, 104, 56)),
+                   (1.0, (138, 68, 42))])
+mask = Image.new("L", (S(dome_w), S(dome_h)), 0)
+md = ImageDraw.Draw(mask)
+md.pieslice([0, 0, S(dome_w), S(dome_h * 2)], 180, 360, fill=255)
+dome = Image.new("RGBA", (S(dome_w), S(dome_h)), (0, 0, 0, 0))
+dome.paste(dome_grad.convert("RGBA"), (0, 0), mask)
+dd = ImageDraw.Draw(dome)
+# ribs
+for rx in (-28, -14, 0, 14, 28):
+    dd.arc([S(rx + dome_w / 2 - 30), S(-6), S(rx + dome_w / 2 + 30), S(dome_h * 2 - 6)],
+           180, 360, fill=(120, 60, 36, 90), width=S(1))
+# sun-side highlight
+hl = Image.new("RGBA", (S(dome_w), S(dome_h)), (0, 0, 0, 0))
+hd2 = ImageDraw.Draw(hl)
+hd2.ellipse([S(10), S(2), S(38), S(26)], fill=(255, 210, 150, 130))
+hl = hl.filter(ImageFilter.GaussianBlur(S(4)))
+dome = Image.alpha_composite(dome, hl)
+art.paste(dome, (S(TX - dome_w / 2), S(SHAFT_TOP - 24 - dome_h)),
+          dome)
+ad = ImageDraw.Draw(art)
+# beacon orb + finial + rays
+bx, by = S(TX), S(SHAFT_TOP - 24 - dome_h - 10)
+ad.line([(bx, S(SHAFT_TOP - 24 - dome_h)), (bx, by + S(5))],
+        fill=(120, 70, 40), width=S(2))
+ad.ellipse([bx - S(6), by - S(6), bx + S(6), by + S(6)], fill=(255, 226, 150))
+for ang in range(0, 360, 45):
+    a = math.radians(ang)
+    ln = S(16) if ang % 90 == 0 else S(9)
+    ad.line([(bx, by), (bx + math.cos(a) * ln, by + math.sin(a) * ln)],
+            fill=(255, 230, 160), width=S(1))
+# pennant flags from the balcony
+for fx, fcol in [(TX - 38, (198, 84, 66)), (TX + 38, (216, 150, 70))]:
+    ad.line([(S(fx), S(SHAFT_TOP - 34)), (S(fx), S(SHAFT_TOP - 12))],
+            fill=(90, 60, 50), width=S(1))
+    ad.polygon([(S(fx), S(SHAFT_TOP - 34)), (S(fx + 16), S(SHAFT_TOP - 30)),
+                (S(fx), S(SHAFT_TOP - 26))], fill=fcol)
+# arched doorway, warm
+arch(ad, S(TX - 11), S(TBASE - 34), S(22), S(34), (64, 40, 66))
+arch(ad, S(TX - 7), S(TBASE - 28), S(14), S(28), (255, 176, 88))
+
+# glow for all lit windows + beacon (screen blend)
+glow_blobs = [(x, y, S(14), (255, 170, 70)) for x, y in lit_windows]
+glow_blobs.append((bx, by, S(34), (255, 205, 110)))
+art = screen_glow(art, glow_blobs, blur=S(8))
+ad = ImageDraw.Draw(art)
+
+# ---------------------------------------------------------------- salt flat
+flat = vgrad(AW, S(H - M - HY), [
+    (0.00, (238, 172, 112)),
+    (0.14, (216, 142, 122)),
+    (0.32, (176, 112, 142)),
+    (0.55, (122, 82, 142)),
+    (0.78, (82, 56, 120)),
+    (1.00, (50, 32, 94)),
+])
+art.paste(flat, (AX0, S(HY)))
+ad = ImageDraw.Draw(art)
+
+# mirrored reflection of the horizon band (town + tower + sun glow)
+band = art.crop((AX0, S(HY - 150), AX1, S(HY)))
+refl = wave_reflect(band, squish=0.5, amp=S(3), wavelength=S(60))
+refl = refl.filter(ImageFilter.GaussianBlur(S(1)))
+# tint toward water violet + fade with depth
+tint = Image.new("RGB", refl.size, (150, 110, 170))
+refl = Image.blend(refl, tint, 0.15)
+fade = vgrad(refl.size[0], refl.size[1],
+             [(0.0, (255, 255, 255)), (0.4, (205, 205, 205)),
+              (1.0, (0, 0, 0))]).convert("L")
+art.paste(refl, (AX0, S(HY)), fade)
+ad = ImageDraw.Draw(art)
+
+# sun reflection column: bright dashes + soft vertical glow
+art = screen_glow(art, [(S(SUN[0]), S(HY + 90), S(60), (255, 190, 100))],
+                  blur=S(26))
+ad = ImageDraw.Draw(art)
+for _ in range(240):
+    t = random.random() ** 1.6
+    y = HY + 6 + t * 330
+    spread = 26 + t * 90
+    x = SUN[0] + random.gauss(0, spread * 0.45)
+    ln = random.uniform(8, 44) * (1 - t * 0.6)
+    a = int(200 * (1 - t))
+    col = (255, 226, 160) if random.random() < 0.6 else (255, 200, 130)
+    ad.line([(S(x - ln / 2), S(y)), (S(x + ln / 2), S(y))],
+            fill=col, width=max(1, S(1)))
+    if random.random() < 0.12:
+        ad.ellipse([S(x - 2), S(y - 1), S(x + 2), S(y + 1)], fill=(255, 240, 200))
+
+# mirror streaks across the flat
+for _ in range(210):
+    t = random.random()
+    y = HY + 8 + t * (H - M - HY - 16)
+    x = random.uniform(M + 10, W - M - 10)
+    ln = random.uniform(14, 170) * (1 - t * 0.5)
+    tone = random.choice([(255, 235, 210), (240, 200, 190), (200, 180, 230),
+                          (255, 210, 150)])
+    ad.line([(S(x - ln / 2), S(y)), (S(x + ln / 2), S(y))],
+            fill=tone, width=max(1, S(1)))
+# ripples: small concentric arcs
+for _ in range(10):
+    x = random.uniform(M + 60, W - M - 60)
+    y = random.uniform(HY + 40, H - M - 60)
+    for k in range(3):
+        r = S(6 + k * 7)
+        ad.arc([S(x) - r, S(y) - r // 3, S(x) + r, S(y) + r // 3], 0, 180,
+               fill=(255, 230, 200), width=max(1, S(1)))
+
+# ---------------------------------------------------------------- path stones
+path_pts = []
+for i in range(15):
+    t = i / 14
+    px = lerp(512, TX - 10, t ** 1.4) + math.sin(t * 9) * 26 * (1 - t)
+    py = lerp(1000, HY + 26, t ** 1.15)
+    path_pts.append((px, py, lerp(26, 7, t)))
+for px, py, r in reversed(path_pts):
+    ad.ellipse([S(px - r), S(py - r * 0.34), S(px + r), S(py + r * 0.34)],
+               fill=(214, 204, 220), outline=(150, 132, 168))
+    ad.ellipse([S(px - r * 0.6), S(py - r * 0.3), S(px + r * 0.4), S(py - r * 0.05)],
+               fill=(238, 230, 240))
+
+# ---------------------------------------------------------------- people
+shadow_layer = Image.new("RGBA", (SW, SH), (0, 0, 0, 0))
+shd = ImageDraw.Draw(shadow_layer)
+fig_glow = []
+
+
+def traveller(x, y, h, robe, scarf, staff=False, lantern=False, point=False):
+    """Robed figure, feet at (x, y), height h (unit px). Sun upper-right:
+    shadows fall down-left, rim light on right edges."""
+    # soft long shadow
+    shd.ellipse([S(x - h * 0.95), S(y - h * 0.03), S(x + h * 0.25), S(y + h * 0.16)],
+                fill=(30, 16, 50, 90))
+    dark = mix(robe, (40, 24, 60), 0.45)
+    light = mix(robe, (255, 220, 160), 0.35)
+    # robe: tapered, slightly billowed
+    ad.polygon([
+        (S(x - h * 0.13), S(y - h * 0.80)),
+        (S(x + h * 0.13), S(y - h * 0.80)),
+        (S(x + h * 0.30), S(y - h * 0.06)),
+        (S(x + h * 0.34), S(y)),
+        (S(x - h * 0.34), S(y)),
+        (S(x - h * 0.28), S(y - h * 0.10)),
+    ], fill=robe)
+    # shaded left half + fold lines
+    ad.polygon([
+        (S(x - h * 0.13), S(y - h * 0.80)),
+        (S(x - h * 0.02), S(y - h * 0.80)),
+        (S(x - h * 0.10), S(y - h * 0.06)),
+        (S(x - h * 0.34), S(y)),
+        (S(x - h * 0.28), S(y - h * 0.10)),
+    ], fill=dark)
+    for fx in (-0.16, 0.02, 0.18):
+        ad.line([(S(x + fx * h), S(y - h * 0.72)),
+                 (S(x + fx * h * 1.5), S(y - h * 0.08))],
+                fill=mix(dark, robe, 0.4), width=max(1, S(1)))
+    # rim light on the sun side (right edge)
+    ad.line([(S(x + h * 0.13), S(y - h * 0.78)), (S(x + h * 0.33), S(y - h * 0.04))],
+            fill=light, width=max(1, S(2)))
+    # head + headscarf
+    hy = y - h * 0.90
+    ad.ellipse([S(x - h * 0.085), S(hy - h * 0.075),
+                S(x + h * 0.085), S(hy + h * 0.075)], fill=(222, 178, 140))
+    ad.pieslice([S(x - h * 0.115), S(hy - h * 0.105),
+                 S(x + h * 0.115), S(hy + h * 0.075)], 180, 360, fill=scarf)
+    ad.polygon([(S(x - h * 0.10), S(hy - h * 0.02)),
+                (S(x - h * 0.20), S(y - h * 0.52)),
+                (S(x - h * 0.08), S(y - h * 0.55))], fill=scarf)
+    # sash
+    ad.line([(S(x - h * 0.17), S(y - h * 0.52)), (S(x + h * 0.17), S(y - h * 0.46))],
+            fill=mix(scarf, (255, 220, 150), 0.4), width=max(1, S(2)))
     if staff:
-        draw.line([x(bx + h * 0.22), x(by - h * 1.05), x(bx + h * 0.16), x(by)],
-                  fill=color, width=x(3))
+        ad.line([(S(x + h * 0.24), S(y - h * 0.62)), (S(x + h * 0.34), S(y + h * 0.02))],
+                fill=(90, 62, 40), width=max(1, S(2)))
+        ad.ellipse([S(x + h * 0.24) - S(2), S(y - h * 0.62) - S(2),
+                    S(x + h * 0.24) + S(2), S(y - h * 0.62) + S(2)],
+                   fill=(220, 170, 90))
     if lantern:
-        lx, ly = bx - h * 0.20, by - h * 0.55
-        draw.line([x(bx - h * 0.08), x(shoulder + h * 0.10), x(lx), x(ly)],
-                  fill=color, width=x(3))
-        draw.ellipse([x(lx - 3), x(ly - 4), x(lx + 3), x(ly + 4)],
-                     fill=(255, 200, 110))
+        lx, ly = x + h * 0.30, y - h * 0.55
+        ad.line([(S(x + h * 0.16), S(y - h * 0.66)), (S(lx), S(ly))],
+                fill=(90, 62, 40), width=max(1, S(1)))
+        ad.ellipse([S(lx) - S(4), S(ly) - S(5), S(lx) + S(4), S(ly) + S(5)],
+                   fill=(255, 200, 110))
+        fig_glow.append((S(lx), S(ly), S(16), (255, 180, 80)))
+    if point:
+        ad.line([(S(x + h * 0.12), S(y - h * 0.66)),
+                 (S(x + h * 0.48), S(y - h * 0.86))],
+                fill=robe, width=max(1, S(3)))
+        ad.ellipse([S(x + h * 0.48) - S(2), S(y - h * 0.86) - S(2),
+                    S(x + h * 0.48) + S(2), S(y - h * 0.86) + S(2)],
+                   fill=(222, 178, 140))
 
 
-def main():
-    # ---------- base: sky gradient over the whole canvas ----------
-    sky = vgrad(W, H, [
-        (0.00, (28, 16, 58)),
-        (0.16, (56, 26, 86)),
-        (0.32, (108, 46, 104)),
-        (0.45, (176, 82, 104)),
-        (0.52, (228, 136, 96)),
-        (0.56, (252, 190, 120)),
-        (0.62, (255, 210, 150)),
-        (0.72, (216, 132, 108)),
-        (0.82, (140, 74, 108)),
-        (0.92, (72, 40, 96)),
-        (1.00, (36, 22, 66)),
-    ])
-    img = sky.convert("RGBA")
-    draw = ImageDraw.Draw(img)
+# group of five crossing the flat
+traveller(268, 742, 62, (176, 84, 52), (232, 190, 120), staff=True)
+traveller(316, 762, 68, (196, 148, 66), (120, 70, 110), lantern=True)
+traveller(362, 748, 60, (70, 122, 122), (232, 190, 120), point=True)
+traveller(404, 770, 66, (124, 72, 112), (196, 148, 66), staff=True)
+traveller(442, 752, 58, (202, 170, 120), (176, 84, 52))
+# figures near the tower + on the steps
+traveller(706, 566, 40, (150, 90, 60), (220, 180, 120))
+traveller(742, 560, 36, (90, 110, 130), (220, 170, 90), lantern=True)
+traveller(TX - 8, TBASE - 26, 30, (180, 120, 80), (200, 160, 100))
+# tiny figures on the horizon path
+for tx, ty, th in [(588, 552, 17), (614, 550, 15)]:
+    shd.ellipse([S(tx - th), S(ty), S(tx + th * 0.3), S(ty + th * 0.18)],
+                fill=(30, 16, 50, 90))
+    ad.polygon([(S(tx - th * 0.14), S(ty - th * 0.8)),
+                (S(tx + th * 0.14), S(ty - th * 0.8)),
+                (S(tx + th * 0.3), S(ty)), (S(tx - th * 0.3), S(ty))],
+               fill=(52, 32, 70))
+    ad.ellipse([S(tx - th * 0.09), S(ty - th * 0.98),
+                S(tx + th * 0.09), S(ty - th * 0.8)], fill=(52, 32, 70))
 
-    # ---------- stars (upper sky only) ----------
-    stars = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    ds = ImageDraw.Draw(stars)
-    for _ in range(260):
-        sx = rng.uniform(0, 1024)
-        sy = rng.uniform(0, 300) * (1.0 - rng.random() ** 2 * 0.4)
-        r = rng.choice([0.7, 0.9, 1.2, 1.6])
-        a = rng.randint(90, 230)
-        ds.ellipse([x(sx - r), x(sy - r), x(sx + r), x(sy + r)],
-                   fill=(255, 244, 220, a))
-    # a few bright stars with a cross sparkle
-    for _ in range(8):
-        sx = rng.uniform(40, 980)
-        sy = rng.uniform(20, 240)
-        r = rng.uniform(1.6, 2.4)
-        ds.ellipse([x(sx - r), x(sy - r), x(sx + r), x(sy + r)],
-                   fill=(255, 250, 235, 255))
-        ds.line([x(sx - r * 3), x(sy), x(sx + r * 3), x(sy)],
-                fill=(255, 250, 235, 160), width=x(1))
-        ds.line([x(sx), x(sy - r * 3), x(sx), x(sy + r * 3)],
-                fill=(255, 250, 235, 160), width=x(1))
-    img.alpha_composite(stars)
+shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(S(3)))
+art = Image.alpha_composite(art.convert("RGBA"), shadow_layer).convert("RGB")
+ad = ImageDraw.Draw(art)
+if fig_glow:
+    art = screen_glow(art, fig_glow, blur=S(6))
+    ad = ImageDraw.Draw(art)
 
-    # ---------- clouds: soft painterly bands ----------
-    clouds = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    for (cx, cy, rx, ry, col) in [
-        (180, 300, 190, 26, (232, 140, 130, 70)),
-        (420, 330, 240, 30, (240, 160, 130, 60)),
-        (760, 285, 200, 24, (226, 130, 140, 65)),
-        (880, 380, 150, 20, (255, 190, 140, 55)),
-        (120, 430, 170, 22, (250, 180, 140, 50)),
-        (560, 420, 260, 26, (244, 170, 140, 55)),
-        (300, 250, 130, 16, (200, 120, 150, 50)),
-        (940, 240, 110, 15, (210, 130, 150, 50)),
-    ]:
-        soft_ellipse(clouds, cx, cy, rx, ry, col, 14)
-    img.alpha_composite(clouds)
-
-    # ---------- sun + glow ----------
-    sun_cx, sun_cy, sun_r = 610, 468, 56
-    halo = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    glow_dot(halo, sun_cx, sun_cy, 190, (255, 190, 120, 90), 60)
-    glow_dot(halo, sun_cx, sun_cy, 110, (255, 215, 150, 110), 40)
-    img.alpha_composite(halo)
-    draw = ImageDraw.Draw(img)
-    draw.ellipse([x(sun_cx - sun_r), x(sun_cy - sun_r),
-                  x(sun_cx + sun_r), x(sun_cy + sun_r)],
-                 fill=(255, 238, 190, 255))
-    draw.ellipse([x(sun_cx - sun_r), x(sun_cy - sun_r),
-                  x(sun_cx + sun_r), x(sun_cy + sun_r)],
-                 outline=(255, 210, 140, 255), width=x(3))
-
-    # ---------- birds ----------
-    draw = ImageDraw.Draw(img)
-    for (bx, by, s) in [(150, 300, 9), (185, 318, 7), (210, 292, 8),
-                        (850, 330, 8), (885, 312, 10), (915, 335, 7),
-                        (480, 260, 7), (520, 278, 6), (95, 360, 8)]:
-        draw.arc([x(bx - s), x(by - s * 0.6), x(bx), x(by + s * 0.6)],
-                 start=200, end=330, fill=(40, 26, 60, 220), width=x(2))
-        draw.arc([x(bx), x(by - s * 0.6), x(bx + s), x(by + s * 0.6)],
-                 start=210, end=340, fill=(40, 26, 60, 220), width=x(2))
-
-    # ---------- mountains: two layers ----------
-    draw = ImageDraw.Draw(img)
-    far = [(0, 548), (0, 505), (90, 478), (180, 500), (280, 470),
-           (380, 498), (470, 482), (560, 505), (700, 490), (820, 508),
-           (940, 484), (1024, 500), (1024, 548)]
-    draw.polygon(pts(far), fill=(150, 104, 138, 255))
-    near = [(0, 548), (0, 522), (120, 512), (240, 530), (360, 514),
-            (520, 532), (660, 516), (800, 530), (920, 518), (1024, 528),
-            (1024, 548)]
-    draw.polygon(pts(near), fill=(74, 48, 88, 255))
-
-    # ---------- town: domed buildings with lit windows ----------
-    town = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    dt = ImageDraw.Draw(town)
-    buildings = [
-        # (x0, width, height, dome?)
-        (52, 46, 34, True), (104, 34, 24, True), (144, 40, 30, True),
-        (190, 30, 20, False), (226, 52, 40, True), (284, 36, 26, True),
-        (326, 28, 18, False), (360, 60, 46, True), (426, 38, 28, True),
-        (470, 30, 22, False), (506, 44, 34, True),
-    ]
-    for (bx, bw, bh, dome) in buildings:
-        top = 548 - bh
-        dt.rectangle([x(bx), x(top), x(bx + bw), x(548)],
-                     fill=(238, 226, 204, 255))
-        if dome:
-            dt.pieslice([x(bx + bw * 0.12), x(top - bw * 0.42),
-                         x(bx + bw * 0.88), x(top + bw * 0.42)],
-                        start=180, end=360, fill=(244, 232, 210, 255))
-        # lit windows
-        for wx in range(bx + 8, bx + bw - 6, 12):
-            wy = top + rng.randint(8, max(9, bh - 12))
-            dt.rectangle([x(wx), x(wy), x(wx + 5), x(wy + 7)],
-                         fill=(255, 196, 110, 255))
-    # two slender minarets
-    for mx in (170, 452):
-        dt.rectangle([x(mx), x(548 - 62), x(mx + 9), x(548)],
-                     fill=(232, 220, 198, 255))
-        dt.polygon(pts([(mx - 2, 548 - 62), (mx + 11, 548 - 62),
-                        (mx + 4.5, 548 - 78)]), fill=(214, 128, 84, 255))
-        dt.rectangle([x(mx + 2), x(548 - 52), x(mx + 7), x(548 - 44)],
-                     fill=(255, 200, 120, 255))
-    # warm glow dots over the town windows
-    for _ in range(40):
-        gx = rng.uniform(55, 545)
-        gy = rng.uniform(500, 542)
-        glow_dot(town, gx, gy, rng.uniform(3, 6), (255, 200, 120, 60), 4)
-    img.alpha_composite(town)
-
-    # ---------- observatory tower (own layer, for a true reflection) ----------
-    tower = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    dt = ImageDraw.Draw(tower)
-    tx = 758                      # tower centre x
-    base_y = 548
-    # stepped platform
-    for i, (w, h) in enumerate([(120, 8), (100, 8), (80, 8)]):
-        dt.rectangle([x(tx - w / 2), x(base_y - 24 + i * 8),
-                      x(tx + w / 2), x(base_y - 16 + i * 8)],
-                     fill=lerp((226, 214, 188), (170, 158, 140), i / 2))
-    # shaft (slightly tapered, stone bands)
-    dt.polygon(pts([(tx - 30, 524), (tx - 24, 404),
-                    (tx + 24, 404), (tx + 30, 524)]),
-               fill=(233, 223, 201, 255))
-    for by in range(424, 520, 24):
-        t = (by - 404) / (524 - 404)
-        half = 24 + (30 - 24) * t
-        dt.line([x(tx - half), x(by), x(tx + half), x(by)],
-                fill=(198, 186, 164, 255), width=x(2))
-    # shaded left edge of the shaft
-    dt.polygon(pts([(tx - 30, 524), (tx - 24, 404),
-                    (tx - 18, 404), (tx - 22, 524)]),
-               fill=(196, 184, 162, 255))
-    # lit arched windows up the shaft
-    for wy in (418, 446, 474, 500):
-        dt.rounded_rectangle([x(tx - 7), x(wy), x(tx + 7), x(wy + 22)],
-                             radius=x(6), fill=(255, 198, 112, 255))
-        glow_dot(tower, tx, wy + 11, 12, (255, 200, 120, 70), 6)
-    # balcony ring
-    dt.rectangle([x(tx - 40), x(392), x(tx + 40), x(404)],
-                 fill=(214, 200, 176, 255))
-    for rx in range(tx - 36, tx + 37, 8):
-        dt.line([x(rx), x(384), x(rx), x(392)], fill=(150, 138, 118, 255),
-                width=x(2))
-    dt.rectangle([x(tx - 40), x(382), x(tx + 40), x(385)],
-                 fill=(150, 138, 118, 255))
-    # copper dome: smooth vertical gradient clipped to the dome shape
-    dw, dh = x(104), x(104)
-    dgrad = vgrad(dw, dh, [(0.0, (240, 150, 84)), (0.45, (208, 114, 62)),
-                           (1.0, (162, 80, 46))]).convert("RGBA")
-    dmask = Image.new("L", (dw, dh), 0)
-    ImageDraw.Draw(dmask).pieslice([0, 0, dw - 1, dh - 1], 180, 360,
-                                   fill=255)
-    dome_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    dome_layer.paste(dgrad, (x(tx - 52), x(300)), dmask)
-    tower.alpha_composite(dome_layer)
-    dt = ImageDraw.Draw(tower)
-    # sun-side highlight on the dome
-    hl = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    soft_ellipse(hl, tx + 22, 330, 26, 34, (255, 196, 130, 120), 12)
-    tower.alpha_composite(hl)
-    dt = ImageDraw.Draw(tower)
-    dt.arc([x(tx - 52), x(300), x(tx + 52), x(404)], start=200, end=340,
-           fill=(255, 186, 118, 255), width=x(4))
-    # dome window (dark slit with warm glass)
-    dt.rounded_rectangle([x(tx - 6), x(326), x(tx + 6), x(370)],
-                         radius=x(5), fill=(52, 30, 66, 255))
-    dt.rounded_rectangle([x(tx - 3), x(330), x(tx + 3), x(366)],
-                         radius=x(3), fill=(255, 190, 110, 255))
-    # finial + beacon orb (sits just above the dome, clear of the subtitle)
-    dt.line([x(tx), x(300), x(tx), x(286)], fill=(120, 84, 60, 255),
-            width=x(4))
-    dt.ellipse([x(tx - 6), x(282), x(tx + 6), x(294)],
-               fill=(255, 214, 140, 255))
-    img.alpha_composite(tower)
-
-    # beacon glow + star rays (above everything local)
-    beacon = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    glow_dot(beacon, tx, 288, 30, (255, 210, 130, 110), 16)
-    glow_dot(beacon, tx, 288, 14, (255, 235, 190, 150), 7)
-    db = ImageDraw.Draw(beacon)
-    for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)]:
-        db.polygon(pts([(tx, 288), (tx + dx * 24, 288 + dy * 24 + 2),
-                        (tx + dx * 24, 288 + dy * 24 - 2)]),
-                   fill=(255, 240, 200, 160))
-    img.alpha_composite(beacon)
-
-    # ---------- mirror: reflection of tower + town ----------
-    # flip the tower layer around the horizon line
-    crop = tower.crop((0, 0, W, HORIZON))
-    refl = crop.transpose(Image.FLIP_TOP_BOTTOM)
-    refl_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    refl_layer.paste(refl, (0, HORIZON))
-    # ripple: shift each row of the reflection band by a gentle wobble
-    arr = np.array(refl_layer)
-    band = arr[HORIZON:HORIZON + x(320)]
-    for j in range(band.shape[0]):
-        shift = int(round(math.sin(j * 0.07) * 2.0 *
-                          (1 + j / 320.0) + np_rng.normal(0, 0.8)))
-        if shift:
-            band[j] = np.roll(band[j], shift, axis=0)
-    # water tints the reflection toward the mirror's mauve, then it
-    # fades with depth
-    rgb = band[:, :, :3].astype(np.float64)
-    band[:, :, :3] = (rgb * 0.72 +
-                      np.array([150.0, 90.0, 120.0]) * 0.28).astype(np.uint8)
-    fade = np.linspace(0.88, 0.25, band.shape[0])[:, None]
-    band[:, :, 3] = (band[:, :, 3].astype(np.float64) * fade).astype(np.uint8)
-    arr[HORIZON:HORIZON + x(320)] = band
-    refl_layer = Image.fromarray(arr, "RGBA")
-    img.alpha_composite(refl_layer)
-
-    # soft dark reflection of the town band
-    town_refl = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    dt = ImageDraw.Draw(town_refl)
-    dt.rectangle([x(52), x(548), x(550), x(585)], fill=(90, 60, 100, 90))
-    town_refl = town_refl.filter(ImageFilter.GaussianBlur(x(6)))
-    img.alpha_composite(town_refl)
-
-    # ---------- sun reflection column ----------
-    draw = ImageDraw.Draw(img)
-    for _ in range(150):
-        cy = rng.uniform(550, 900)
-        spread = 14 + (cy - 550) * 0.16
-        cx = 610 + rng.gauss(0, spread)
-        ln = rng.uniform(6, 34) * (1.0 - (cy - 550) / 700)
-        a = int(rng.uniform(90, 220) * (1.0 - (cy - 550) / 800))
-        draw.line([x(cx - ln / 2), x(cy), x(cx + ln / 2), x(cy)],
-                  fill=(255, 216, 150, max(20, a)), width=x(2))
-
-    # ---------- mirror streaks + salt cracks ----------
-    draw = ImageDraw.Draw(img)
-    for _ in range(170):
-        cy = rng.uniform(560, 990)
-        cx = rng.uniform(40, 990)
-        ln = rng.uniform(12, 130)
-        col = rng.choice([(255, 240, 220, 70), (255, 220, 180, 60),
-                          (220, 200, 230, 55), (255, 200, 150, 50)])
-        draw.line([x(cx - ln / 2), x(cy), x(cx + ln / 2), x(cy)],
-                  fill=col, width=x(1))
-    for _ in range(9):
-        cx = rng.uniform(60, 960)
-        cy = rng.uniform(620, 980)
-        pts_c = [(cx, cy)]
-        for _ in range(rng.randint(2, 3)):
-            cx += rng.uniform(-30, 30)
-            cy += rng.uniform(-10, 18)
-            pts_c.append((cx, cy))
-        draw.line(pts(pts_c), fill=(52, 32, 76, 70), width=x(1),
-                  joint="curve")
-
-    # ---------- people ----------
-    people = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    dp = ImageDraw.Draw(people)
-    SIL = (38, 26, 58, 255)
-    RIM = (255, 190, 130, 255)
-    # a group crossing the flat, left to right
-    group = [(196, 742, 62, False, False), (248, 762, 70, True, False),
-             (302, 748, 58, False, True), (352, 778, 66, False, False),
-             (404, 762, 60, True, False)]
-    for (gx, gy, gh, staff, lant) in group:
-        person(dp, gx, gy, gh, SIL, RIM, staff=staff, lantern=lant)
-    # two figures near the tower base, one on the steps
-    person(dp, 688, 648, 58, SIL, RIM)
-    person(dp, 838, 668, 62, SIL, RIM, lantern=True)
-    person(dp, 724, 528, 30, SIL, RIM)
-    # two small figures on the horizon path
-    person(dp, 596, 566, 26, SIL, RIM)
-    person(dp, 628, 570, 24, SIL, RIM)
-    img.alpha_composite(people)
-    # lantern glows
-    lan = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    glow_dot(lan, 302 - 0.20 * 58, 748 - 0.55 * 58, 16,
-             (255, 200, 120, 110), 8)
-    glow_dot(lan, 838 - 0.20 * 62, 668 - 0.55 * 62, 16,
-             (255, 200, 120, 110), 8)
-    img.alpha_composite(lan)
-
-    # ---------- winding path of flat stones ----------
-    draw = ImageDraw.Draw(img)
-    path = [(512, 998), (540, 940), (566, 880), (596, 824), (624, 772),
-            (652, 724), (678, 680), (702, 640), (722, 606), (738, 578)]
-    for i, (px, py) in enumerate(path):
-        t = i / (len(path) - 1)
-        rx = 22 - 15 * t
-        ry = 5 - 3 * t
-        stone = []
-        for k in range(8):
-            ang = 2 * math.pi * k / 8
-            jit = 1.0 + rng.uniform(-0.18, 0.18)
-            stone.append((px + math.cos(ang) * rx * jit,
-                          py + math.sin(ang) * ry * jit))
-        draw.polygon(pts(stone),
-                     fill=lerp((226, 208, 196), (196, 172, 172), t))
-        draw.polygon(pts(stone), outline=(140, 110, 130, 140))
-
-    # ---------- foreground salt crystals ----------
-    def crystal(cx, cy, s, flip=False):
-        pts_c = [(cx, cy - s), (cx + s * 0.8, cy - s * 0.25),
-                 (cx + s * 0.55, cy + s * 0.55), (cx - s * 0.45, cy + s * 0.6),
-                 (cx - s * 0.85, cy - s * 0.1)]
-        if flip:
-            pts_c = [(cx - (px - cx), py) for px, py in pts_c]
-        draw.polygon(pts(pts_c), fill=(246, 238, 226, 255))
-        draw.polygon(pts([(cx, cy - s), (cx + s * 0.8, cy - s * 0.25),
-                          (cx + s * 0.55, cy + s * 0.55), (cx, cy + s * 0.2)]),
-                     fill=(214, 196, 214, 255))
-        draw.line(pts([(cx, cy - s), (cx + s * 0.8, cy - s * 0.25)]),
-                  fill=(255, 250, 240, 255), width=x(2))
-
-    draw = ImageDraw.Draw(img)
-    for (cx, cy, s) in [(110, 950, 44), (190, 972, 58), (268, 946, 36),
-                        (70, 990, 30), (150, 912, 26), (240, 990, 28),
-                        (860, 952, 48), (940, 974, 60), (800, 982, 32),
-                        (990, 920, 26), (905, 910, 24)]:
-        crystal(cx, cy, s, flip=rng.random() < 0.5)
-    # scattered small crystals mid-flat
-    for _ in range(16):
-        crystal(rng.uniform(60, 960), rng.uniform(600, 860),
-                rng.uniform(6, 14), flip=rng.random() < 0.5)
-
-    # ---------- painterly dabs + grain + vignette ----------
-    dabs = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    for _ in range(60):
-        cx = rng.uniform(0, 1024)
-        cy = rng.uniform(0, 1024)
-        r = rng.uniform(14, 60)
-        col = rng.choice([(255, 200, 150, 16), (200, 140, 180, 14),
-                          (255, 230, 190, 14), (140, 100, 160, 14)])
-        soft_ellipse(dabs, cx, cy, r, r * 0.55, col, 10)
-    img.alpha_composite(dabs)
-
-    arr = np.array(img.convert("RGB")).astype(np.int16)
-    noise = np_rng.normal(0, 2.5, arr.shape[:2])[..., None]
-    arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
-    img = Image.fromarray(arr, "RGB").convert("RGBA")
-    # vignette
-    yy, xx = np.mgrid[0:H, 0:W]
-    dist = np.sqrt(((xx - W / 2) / (W / 2)) ** 2 +
-                   ((yy - H / 2) / (H / 2)) ** 2)
-    vig = np.clip(1.0 - 0.16 * np.clip(dist - 0.72, 0, None) ** 2 * 4,
-                  0.82, 1.0)
-    arr = np.array(img.convert("RGB")).astype(np.float64)
-    arr = np.clip(arr * vig[..., None], 0, 255).astype(np.uint8)
-    img = Image.fromarray(arr, "RGB").convert("RGBA")
-
-    # ---------- frame ----------
-    draw = ImageDraw.Draw(img)
-    draw.rectangle([0, 0, W - 1, H - 1], outline=CREAM + (255,),
-                   width=FRAME)
-    draw.rectangle([INNER, INNER, W - 1 - INNER, H - 1 - INNER],
-                   outline=(90, 64, 84, 255), width=x(2))
-
-    # ---------- name + subtitle ----------
-    draw = ImageDraw.Draw(img)
-    name = "SALMIRA"
-    size = x(170)
-    while True:
-        font = ImageFont.truetype(FONT_NAME, size)
-        bbox = draw.textbbox((0, 0), name, font=font)
-        if bbox[2] - bbox[0] <= x(900) or size <= x(100):
-            break
-        size -= x(4)
-    tw = bbox[2] - bbox[0]
-    name_x = x(512) - tw / 2 - bbox[0]
-    name_y = x(60)
-    draw.text((name_x, name_y), name, font=font, fill=NAME_COLOR + (255,))
-    # measure the name's real ink bottom so the subtitle never overlaps
-    probe = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-    ImageDraw.Draw(probe).text((name_x, name_y), name, font=font,
-                               fill=(255, 255, 255, 255))
-    ink_bottom = probe.getbbox()[3] / S
-
-    sub = "WHERE THE SKY LIVES TWICE"
-    sub_size = x(30)
-    sub_font = ImageFont.truetype(FONT_SUB, sub_size)
-    tracking = x(9)
-    widths = [draw.textbbox((0, 0), ch, font=sub_font)[2] for ch in sub]
-    total = sum(widths) + tracking * (len(sub) - 1)
-    sx = x(512) - total / 2
-    sy = x(ink_bottom + 16)
-    # rules flanking the subtitle
-    rule_y = sy + x(15)
-    draw.line([x(120), rule_y, sx - x(28), rule_y],
-              fill=(255, 214, 150, 255), width=x(2))
-    draw.line([sx + total + x(28), rule_y, x(904), rule_y],
-              fill=(255, 214, 150, 255), width=x(2))
-    for ch, wch in zip(sub, widths):
-        draw.text((sx, sy), ch, font=sub_font, fill=SUB_COLOR + (255,))
-        sx += wch + tracking
-
-    # ---------- downscale + save ----------
-    out = img.convert("RGB").resize((1024, 1024), Image.LANCZOS)
-    out.save("entry.png", optimize=True)
-    out.resize((480, 480), Image.LANCZOS).save("preview-480.png",
-                                               optimize=True)
-    print("saved entry.png + preview-480.png")
+# ---------------------------------------------------------------- salt crystals
+def crystal(x, y, s):
+    """Faceted salt crystal: three tones + sparkle."""
+    top = (242, 236, 250)
+    left = (198, 190, 222)
+    right = (148, 140, 182)
+    pts_top = [(x, y - s), (x + s * 0.62, y - s * 0.28), (x, y + s * 0.1),
+               (x - s * 0.62, y - s * 0.28)]
+    pts_left = [(x - s * 0.62, y - s * 0.28), (x, y + s * 0.1),
+                (x, y + s * 0.72), (x - s * 0.62, y + s * 0.34)]
+    pts_right = [(x, y + s * 0.1), (x + s * 0.62, y - s * 0.28),
+                 (x + s * 0.62, y + s * 0.34), (x, y + s * 0.72)]
+    ad.polygon([(S(px), S(py)) for px, py in pts_left], fill=left)
+    ad.polygon([(S(px), S(py)) for px, py in pts_right], fill=right)
+    ad.polygon([(S(px), S(py)) for px, py in pts_top], fill=top)
+    ad.line([(S(x), S(y - s)), (S(x), S(y + s * 0.1))],
+            fill=(255, 255, 255), width=max(1, S(1)))
+    if random.random() < 0.7:
+        ad.ellipse([S(x - 2), S(y - s * 0.5) - S(2), S(x + 2), S(y - s * 0.5) + S(2)],
+                   fill=(255, 255, 255))
 
 
-if __name__ == "__main__":
-    main()
+for cx, cy, cs in [(70, 950, 46), (130, 972, 58), (200, 952, 38), (36, 986, 30),
+                   (900, 956, 52), (950, 980, 44), (842, 976, 34), (988, 946, 28)]:
+    crystal(cx, cy, cs)
+for _ in range(10):
+    crystal(random.uniform(80, 940), random.uniform(620, 880),
+            random.uniform(8, 18))
+
+# ---------------------------------------------------------------- brush texture
+dabs = brush_dabs((SW, SH), [
+    ((AX0, AY0, AX1, S(540)),
+     [(240, 200, 180), (170, 120, 190), (255, 220, 170), (120, 80, 160)],
+     True, 20),
+    ((AX0, S(545), AX1, AY1),
+     [(255, 225, 190), (200, 160, 210), (150, 110, 180), (240, 180, 140)],
+     True, 20),
+    ((S(700), S(280), S(900), S(560)),
+     [(240, 220, 190), (200, 170, 150), (230, 170, 110)],
+     False, 18),
+], n=900)
+art = Image.alpha_composite(art.convert("RGBA"), dabs).convert("RGB")
+
+# ---------------------------------------------------------------- grain + vignette
+art = add_grain(art, sigma_fine=1.6, sigma_coarse=2.2)
+vig = Image.new("L", (SW, SH), 0)
+vd = ImageDraw.Draw(vig)
+vd.ellipse([-SW * 0.25, -SH * 0.25, SW * 1.25, SH * 1.25], fill=255)
+vig = vig.filter(ImageFilter.GaussianBlur(S(180)))
+dark = Image.new("RGB", (SW, SH), (18, 10, 40))
+art = Image.composite(art, Image.blend(art, dark, 0.22), vig)
+
+# ---------------------------------------------------------------- frame + text
+canvas.paste(art.crop((AX0, AY0, AX1, AY1)), (AX0, AY0))
+cd = ImageDraw.Draw(canvas)
+cd.rectangle([AX0 - S(2), AY0 - S(2), AX1 + S(2), AY1 + S(2)],
+             outline=(74, 52, 84), width=S(2))
+
+# name: fit to width
+NAME = "SALMIRA"
+target_w = S(880)
+size = S(200)
+font = ImageFont.truetype(NAME_FONT, size)
+tw = cd.textlength(NAME, font=font)
+font = ImageFont.truetype(NAME_FONT, int(size * target_w / tw))
+name_w = cd.textlength(NAME, font=font)
+nx = (SW - name_w) / 2
+ny = S(58)
+# soft dark shadow for legibility, then cream letters
+cd.text((nx + S(3), ny + S(4)), NAME, font=font, fill=(30, 18, 56))
+cd.text((nx, ny), NAME, font=font, fill=(250, 244, 224))
+name_ink_bottom = cd.textbbox((nx, ny), NAME, font=font)[3]
+
+# subtitle, letterspaced gold with flanking rules, below the name's ink
+SUB = "WHERE THE SKY LIVES TWICE"
+sub_size = S(27)
+sfont = ImageFont.truetype(SUB_FONT, sub_size)
+spacing = S(9)
+widths = [cd.textlength(ch, font=sfont) for ch in SUB]
+total = sum(widths) + spacing * (len(SUB) - 1)
+sx = S(472) - total / 2  # centred left of the tower dome
+sy = name_ink_bottom + S(14)
+cd.line([(sx - S(64), sy + S(14)), (sx - S(14), sy + S(14))],
+        fill=(233, 200, 122), width=S(2))
+cd.line([(sx + total + S(14), sy + S(14)), (sx + total + S(40), sy + S(14))],
+        fill=(233, 200, 122), width=S(2))
+cx = sx
+for ch, wch in zip(SUB, widths):
+    cd.text((cx + S(1), sy + S(2)), ch, font=sfont, fill=(40, 24, 66))
+    cd.text((cx, sy), ch, font=sfont, fill=(233, 200, 122))
+    cx += wch + spacing
+
+# ---------------------------------------------------------------- finish
+final = canvas.resize((W, H), Image.LANCZOS)
+final.save("entry.png", optimize=True)
+print("saved entry.png")
